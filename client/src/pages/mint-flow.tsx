@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { CONTRACT_CONFIG } from "@/config/contracts";
+import { CONTRACT_CONFIG, validateEvmAddress } from "@/config/contracts";
 import { CHAIN_CONFIG, truncateAddress } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import { Flame, CheckCircle, ArrowRight, ExternalLink, RefreshCcw, Coins } from "lucide-react";
@@ -45,25 +45,40 @@ export default function MintFlow() {
 
   // Initialize Ethers listener
   useEffect(() => {
-    if ((window as any).ethereum) {
-      const provider = new BrowserProvider((window as any).ethereum);
+    const ethereum = (window as any).ethereum;
+    if (ethereum) {
+      const provider = new BrowserProvider(ethereum);
       provider.getNetwork().then(network => setChainId(Number(network.chainId)));
       
-      (window as any).ethereum.on('chainChanged', (newChainId: string) => {
+      const handleChainChanged = (newChainId: string) => {
         setChainId(Number(newChainId));
-      });
-      (window as any).ethereum.on('accountsChanged', (accounts: string[]) => {
+      };
+      const handleAccountsChanged = (accounts: string[]) => {
         setEvmAddress(accounts[0] || "");
-      });
+      };
+
+      ethereum.on('chainChanged', handleChainChanged);
+      ethereum.on('accountsChanged', handleAccountsChanged);
+
+      return () => {
+        ethereum.removeListener('chainChanged', handleChainChanged);
+        ethereum.removeListener('accountsChanged', handleAccountsChanged);
+      };
     }
-    
-    // Load from local storage
-    const saved = localStorage.getItem("pitchfork_state");
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      setTxHashes(parsed.txHashes || {});
-      setCurrentStepIndex(parsed.stepIndex || 0);
-      setN3Address(parsed.n3Address || "");
+  }, []);
+
+  // Load from local storage
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("pitchfork_state");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        setTxHashes(parsed.txHashes || {});
+        setCurrentStepIndex(parsed.stepIndex || 0);
+        setN3Address(parsed.n3Address || "");
+      }
+    } catch {
+      localStorage.removeItem("pitchfork_state");
     }
   }, []);
 
@@ -78,19 +93,27 @@ export default function MintFlow() {
 
   // Helpers
   const switchChain = async (targetChainId: number) => {
-    if (!(window as any).ethereum) return;
-    try {
-      await (window as any).ethereum.request({
-        method: 'wallet_switchEthereumChain',
-        params: [{ chainId: '0x' + targetChainId.toString(16) }],
-      });
-    } catch (error: any) {
-      toast({
-        title: "Network Switch Failed",
-        description: error.message,
-        variant: "destructive"
-      });
-    }
+    const ethereum = (window as any).ethereum;
+    if (!ethereum) return;
+    await ethereum.request({
+      method: 'wallet_switchEthereumChain',
+      params: [{ chainId: '0x' + targetChainId.toString(16) }],
+    });
+    // Wait for the chainChanged event to fire (up to 10s)
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        ethereum.removeListener('chainChanged', handler);
+        reject(new Error('Chain switch timed out'));
+      }, 10000);
+      const handler = (newChainId: string) => {
+        if (Number(newChainId) === targetChainId) {
+          clearTimeout(timeout);
+          ethereum.removeListener('chainChanged', handler);
+          resolve();
+        }
+      };
+      ethereum.on('chainChanged', handler);
+    });
   };
 
   const advanceStep = () => {
@@ -101,7 +124,7 @@ export default function MintFlow() {
 
   // Actions
   const handleN3Burn = async (manualHash?: string) => {
-    if (!manualHash) {
+    if (manualHash === undefined) {
       // Simulate N3 wallet interaction
       toast({ title: "Initiating N3 Burn..." });
       setIsProcessing(true);
@@ -112,7 +135,12 @@ export default function MintFlow() {
       toast({ title: "Burn Confirmed!", description: "Pitchfork burned on N3." });
       advanceStep();
     } else {
-      setTxHashes(prev => ({ ...prev, N3_BURN: manualHash }));
+      const trimmed = manualHash.trim();
+      if (!trimmed || trimmed.length < 10) {
+        toast({ title: "Invalid Hash", description: "Please enter a valid transaction hash.", variant: "destructive" });
+        return;
+      }
+      setTxHashes(prev => ({ ...prev, N3_BURN: trimmed }));
       advanceStep();
     }
   };
@@ -125,21 +153,24 @@ export default function MintFlow() {
     
     setIsProcessing(true);
     try {
-      const provider = new BrowserProvider((window as any).ethereum);
-      const signer = await provider.getSigner();
-      
-      // Chain check
+      // Chain check — switch before creating provider/signer
       const targetChainId = type === "ETH_BURN" ? CHAIN_CONFIG.ETHEREUM.id : CHAIN_CONFIG.NEO_X.id;
       if (chainId !== targetChainId) {
         await switchChain(targetChainId);
-        // Wait for chain switch to propagate
-        await new Promise(r => setTimeout(r, 1000));
       }
+
+      // Create provider/signer AFTER chain switch so they're on the correct chain
+      const provider = new BrowserProvider((window as any).ethereum);
+      const signer = await provider.getSigner();
+
+      // Validate target address before sending
+      const targetAddress = type === "PAYMENT_NEOX" ? CONTRACT_CONFIG.TREASURY_NEOX : (type === "NEOX_BURN" ? CONTRACT_CONFIG.PITCHFORK_NEOX : CONTRACT_CONFIG.PITCHFORK_ETH);
+      validateEvmAddress(targetAddress, type);
 
       // Mock Transaction
       // In real app: contract.burn() or sendTransaction
       const tx = await signer.sendTransaction({
-        to: type === "PAYMENT_NEOX" ? CONTRACT_CONFIG.TREASURY_NEOX : (type === "NEOX_BURN" ? CONTRACT_CONFIG.PITCHFORK_NEOX : CONTRACT_CONFIG.PITCHFORK_ETH),
+        to: targetAddress,
         value: parseEther("0") // 0 value for demo burn, real app would be token transfer
       });
 
@@ -160,9 +191,26 @@ export default function MintFlow() {
   };
 
   const handleMint = async () => {
+    if (!(window as any).ethereum) {
+      toast({ title: "No Wallet", description: "Please install an EVM wallet.", variant: "destructive" });
+      return;
+    }
+    if (!evmAddress) {
+      toast({ title: "Connect Wallet", description: "Please connect your EVM wallet first.", variant: "destructive" });
+      return;
+    }
+
+    // Verify all previous steps are completed
+    const requiredSteps = ["N3_BURN", "NEOX_BURN", "ETH_BURN", "PAYMENT"] as const;
+    const missing = requiredSteps.filter(step => !txHashes[step]);
+    if (missing.length > 0) {
+      toast({ title: "Incomplete Steps", description: `Missing: ${missing.join(", ")}. Complete all previous steps first.`, variant: "destructive" });
+      return;
+    }
+
     setIsProcessing(true);
     try {
-        // Verify all previous steps
+        // Switch chain before creating provider/signer
         if (chainId !== CHAIN_CONFIG.NEO_X.id) {
             await switchChain(CHAIN_CONFIG.NEO_X.id);
         }
@@ -170,6 +218,7 @@ export default function MintFlow() {
         // Mock Mint Call
         await new Promise(r => setTimeout(r, 3000)); // Simulate verifying proofs
         
+        // Create provider/signer AFTER chain switch
         const provider = new BrowserProvider((window as any).ethereum);
         const signer = await provider.getSigner();
         const tx = await signer.sendTransaction({
@@ -184,7 +233,7 @@ export default function MintFlow() {
             className: "bg-primary text-black border-none"
         });
     } catch (error: any) {
-        toast({ title: "Mint Failed", description: error.message, variant: "destructive" });
+        toast({ title: "Mint Failed", description: error.message || "Unknown error", variant: "destructive" });
     } finally {
         setIsProcessing(false);
     }
@@ -308,11 +357,13 @@ export default function MintFlow() {
                                 variant="outline" 
                                 className="border-yellow-500/50 text-yellow-500"
                                 onClick={() => {
-                                    const val = (document.getElementById("n3-pay-hash") as HTMLInputElement).value;
-                                    if(val) {
-                                        setTxHashes(prev => ({...prev, PAYMENT: val}));
-                                        advanceStep();
+                                    const val = (document.getElementById("n3-pay-hash") as HTMLInputElement).value.trim();
+                                    if(!val || val.length < 10) {
+                                        toast({ title: "Invalid Hash", description: "Please enter a valid transaction hash.", variant: "destructive" });
+                                        return;
                                     }
+                                    setTxHashes(prev => ({...prev, PAYMENT: val}));
+                                    advanceStep();
                                 }}
                             >
                                 Verify

@@ -16,13 +16,13 @@ export const CHAIN_CONFIG = {
     name: "Neo X Mainnet",
     rpc: "https://mainnet-1.rpc.banelabs.org",
     symbol: "GAS",
-    explorer: "https://xexplorer.neo.org"
+    explorer: "https://xexplorer.neo.org/"
   },
   ETHEREUM: {
     id: 1,
     name: "Ethereum Mainnet",
     rpc: "https://cloudflare-eth.com", // Fallback
     symbol: "ETH",
-    explorer: "https://etherscan.io"
+    explorer: "https://etherscan.io/"
   }
 };
